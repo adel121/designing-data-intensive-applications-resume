@@ -1,3 +1,21 @@
+- [Common Terms:](#common-terms)
+- [Reliability](#reliability)
+  - [Definition](#definition)
+  - [Faults](#faults)
+    - [Hardware Faults](#hardware-faults)
+    - [Software Faults](#software-faults)
+- [Scalability](#scalability)
+  - [Definition](#definition-1)
+  - [Describing Load](#describing-load)
+  - [Working Example](#working-example)
+    - [Choosing the best approach](#choosing-the-best-approach)
+  - [Describing Performance](#describing-performance)
+    - [Measuring Response Time](#measuring-response-time)
+    - [SLOs and SLAs](#slos-and-slas)
+    - [Head-of-Line Blocking](#head-of-line-blocking)
+  - [Coping with Load](#coping-with-load)
+- [Maintainability](#maintainability)
+
 ## Common Terms:
 - reliability
 - faults
