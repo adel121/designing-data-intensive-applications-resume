@@ -22,6 +22,7 @@
 * monotonic reads
 * strong consistency
 * consistent prefix reads
+* master-master / active-active
 
 ## Introduction
 
@@ -235,3 +236,102 @@ When working with eventually consistent systems, it is important to evaluate how
 If this can result in bad user experience, it's important to design the system to provide stringer guarantee such as read-after-write.
 
 ## Multi-Leader Replication
+
+### Why we need more than one leader
+
+Single-leader replication has a major downside: all writes need to go through the leader, so the leader is a single point of failure for write operations.
+
+Multi-leader replication extends what we explained before by allowing more than one node to accept writes:
+
+Replication still happens: each node that processes a write request should replicate the change to all other leaders. (known as *master-master* or *active-active*).
+
+Each leader simultaneously acts as a follower to other leaders.
+
+### Use cases for multi leader setup
+
+#### Multi-datacenter operation
+* each datacenter contains exactly one leader
+* within each datacenter, normal leader-follower replication is done
+* each leader replicates data to leaders of other datacenters.
+
+This can be seen in the figure below:
+![1735844898400](image/summary/1735844898400.png)
+
+Advantages:
+* Lower latency: 
+  * write requests can be served from any datacenter
+  * inter-datacenter replication is handled asynchronously
+* Better tolerance to datacenter outages:
+  * each datacenter can continue to operate independently of other datacenters
+  * replication catches up when the datacenter is available again
+
+Disadvantages:
+* write conflicts are possible: the same data might be modified in 2 different datacenters, resulting in a write conflict when performing replication.
+* autoincrementing keys, triggers and integrity constraints can be problematic.
+
+#### Clients with offline operation
+
+Multi-leader setup can also be used in applications that need to continue while disconnected from the internet.
+
+Calendar apps on mobile phones, laptop and other devices is a good example.
+
+The app instance on each device has a local database that acts as a leader, and tries to replicate changes to all other devices.
+
+Replication lag can reach minutes, hours or days.
+
+Each device can be thought of as a separate datacenter with one replica.
+
+#### Collaborative editing
+
+Real-time collaborative editing applications also have a lot in common with multi-leader replication setups.
+
+When one user edits a document, the changes are instantly applied to their local replica and asynchronously replicated to the server and any other users who are editing the same document.
+
+Write conflicts can arise, and the application might use locks on document characters before the user can edit a character.
+
+
+### Handling Write Conflicts
+
+Write conflicts can occur in multi-leader setups.
+
+An example is shown in the figure below:
+
+![1735846335198](image/summary/1735846335198.png)
+
+#### Synchronous vs Asynchronous conflict detection
+
+If leader-leader replication is done asynchronously, the conflict will not be detected synchronously.
+
+To make conflict detection synchronous, the leader can synchronously replicate the change to other leaders before committing the write and returning successful response. However, this goes against the big advantage that each leader can operate independently.
+
+For this reason, instead of forcing synchronous conflict detection, we can simply use single-leader replication.
+
+#### Conflict Avoidance
+
+A frequently recommended approach is to simply avoid write conflicts by forcing all writes for a particular record to always go through the same leader.
+
+However, if we want to change the leader for a designated record in case of datacenter failure or a user has moved to another location, then conflict avoidance breaks and you have to deal with the possibility of concurrent wirtes on different leaders.
+
+#### Converging toward a consistent state
+
+In multi-leader setups, there is no defined ordering of writes that happen concurrently, so it's not clear what the final value of the record should be.
+
+If each leader applies writes in the order they are received, we might end up with different values on different leaders.
+
+Conflicts should be resolved in a convergent manner: all leader should arrive at the same final value when everything has been replicated.
+
+There are several ways of achieving conflict resolution convergence:
+* Last-Write-Wins (LWW): give each write a unique ID (timestamp, long random number, UUID, etc.), and pick the write with the highest ID as the winner. This approach is prone to data loss.
+* Give each replica a unique ID, and prioritize writes originating from replicas having higher ID. This also implies data loss.
+* If possible, merge values together (e.g. order them and concatenate them).
+* Record conflict in an explicit data structure that preserves all information, and write application code that resolves the conflict at some later time.
+
+#### Custom conflict resolution logic
+
+Most multi-leader replication tools let you write conflict resolution logic using application code, which may be executed on write or on read:
+
+* On write: when the database system detects a conflict in the log of replicated changes, it calls the conflict handler.
+* On read: when a conflict is detected, all conflicting  writes are stored. The next time the data is read, all conflicting versions are provided to the application, which will be responsible to resolve the conflict and rewrite the reconciled value to the database.
+
+Conflict resolution applies at the level of row or document, not at the level of a transaction.
+
