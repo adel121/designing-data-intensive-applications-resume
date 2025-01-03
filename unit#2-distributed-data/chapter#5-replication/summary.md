@@ -1,3 +1,57 @@
+## Table of Contents
+- [Table of Contents](#table-of-contents)
+- [Common Terms](#common-terms)
+- [Introduction](#introduction)
+- [Challenge with data replication](#challenge-with-data-replication)
+- [Leaders and Followers](#leaders-and-followers)
+  - [Asynchronous vs Synchronous Replication](#asynchronous-vs-synchronous-replication)
+  - [Setting Up New Followers](#setting-up-new-followers)
+  - [Handling Node Outages](#handling-node-outages)
+    - [Follower Failure: Catch-up Recovery](#follower-failure-catch-up-recovery)
+    - [Leader  failure: Failover](#leader--failure-failover)
+      - [What can go wrong](#what-can-go-wrong)
+  - [Implementation of Replication Log](#implementation-of-replication-log)
+    - [Statement-based replication](#statement-based-replication)
+    - [Write-ahead log (WAL) shipping](#write-ahead-log-wal-shipping)
+    - [Logical (row-based) log replication](#logical-row-based-log-replication)
+    - [Trigger-based replication](#trigger-based-replication)
+  - [Problems with Replication Lag](#problems-with-replication-lag)
+    - [Reading Your Own Writes](#reading-your-own-writes)
+    - [Monotonic Reads](#monotonic-reads)
+    - [Consistent Prefix Reads](#consistent-prefix-reads)
+  - [Solution for Replication Lag](#solution-for-replication-lag)
+- [Multi-Leader Replication](#multi-leader-replication)
+  - [Why we need more than one leader](#why-we-need-more-than-one-leader)
+  - [Use cases for multi leader setup](#use-cases-for-multi-leader-setup)
+    - [Multi-datacenter operation](#multi-datacenter-operation)
+    - [Clients with offline operation](#clients-with-offline-operation)
+    - [Collaborative editing](#collaborative-editing)
+  - [Handling Write Conflicts](#handling-write-conflicts)
+    - [Synchronous vs Asynchronous conflict detection](#synchronous-vs-asynchronous-conflict-detection)
+    - [Conflict Avoidance](#conflict-avoidance)
+    - [Converging toward a consistent state](#converging-toward-a-consistent-state)
+    - [Custom conflict resolution logic](#custom-conflict-resolution-logic)
+  - [Mutli-Leader Replication Topologies](#mutli-leader-replication-topologies)
+- [Leaderless Replication](#leaderless-replication)
+  - [What happens if a node is down?](#what-happens-if-a-node-is-down)
+    - [Read Repair](#read-repair)
+    - [Anti-Entropy process](#anti-entropy-process)
+    - [Quorums for reading and writing](#quorums-for-reading-and-writing)
+  - [Limitations of Quorum Consistency](#limitations-of-quorum-consistency)
+    - [Monitoring Staleness](#monitoring-staleness)
+  - [Sloppy Quoroms and Hinted Handoff](#sloppy-quoroms-and-hinted-handoff)
+    - [Sloppy Quorum](#sloppy-quorum)
+    - [Hinted Handoff](#hinted-handoff)
+    - [Why use sloppy quorums?](#why-use-sloppy-quorums)
+    - [Applying leaderless replication in multidatacenter setup](#applying-leaderless-replication-in-multidatacenter-setup)
+  - [Detecting Concurrent Writes](#detecting-concurrent-writes)
+    - [LWW](#lww)
+    - [Happens-before relationship and concurrency](#happens-before-relationship-and-concurrency)
+    - [Capturing the happens-before relationship](#capturing-the-happens-before-relationship)
+      - [Merging Concurrently Written Values](#merging-concurrently-written-values)
+      - [Version Vectors](#version-vectors)
+
+
 ## Common Terms
 
 * replication
@@ -23,6 +77,15 @@
 * strong consistency
 * consistent prefix reads
 * master-master / active-active
+* LWW (last write wins)
+* Replication Topologies
+* Dynamo-style database
+* Read Repair
+* Anti-entropy
+* quorum reads and writes ( `w + r > n`)
+* Sloppy quorums
+* Hinted handoff
+* Version Vectors
 
 ## Introduction
 
@@ -334,4 +397,218 @@ Most multi-leader replication tools let you write conflict resolution logic usin
 * On read: when a conflict is detected, all conflicting  writes are stored. The next time the data is read, all conflicting versions are provided to the application, which will be responsible to resolve the conflict and rewrite the reconciled value to the database.
 
 Conflict resolution applies at the level of row or document, not at the level of a transaction.
+
+### Mutli-Leader Replication Topologies
+
+A replication topology describes the communication paths along which writes are propagated from one node to another.
+
+Different topologies are shown in the figure below:
+
+![1735847865651](image/summary/1735847865651.png)
+
+In circular topologies, infinite loops are avoided by maintaining on the replication operation an identifier of each replica that has processed the operation. When a replica receives an operation holding its identifier, it discards it.
+
+The main issue with circular and star topologies is that the failure of a node can interrupt the replication process.
+
+However, in all-to-all topology, it is possible to have causality issues because some network links might be faster than others, resulting in replications being transmitted out-of-order on some replicas as shown in the figure below.
+
+![1735848162710](image/summary/1735848162710.png)
+
+## Leaderless Replication
+
+In leaderless Replication, we don't have a leader that decides the order used to apply writes by all followers. Instead, any replica is allowed to directly accept write requests from clients.
+
+This approach is adopted by amazon's dynamo-style database.
+
+In some implementations, the client sends the write request to many nodes in parallel. In other implementations, the client sends the write request to a coordinator node which in turn diffuses the write request to multiple replicas. In both cases, no order is enforced.
+
+### What happens if a node is down?
+
+Consider 3 replicas that can all receive write requests.
+
+If one of the 3 nodes is down, the client can still send the write requests as follows:
+* the client sends the write requests to the 3 nodes
+* only 2 nodes reply with success
+* the client considers the result to be a success (it's sufficient for 2 out of 3 replicas to accept the write).
+
+When the failing node recovers, 2 nodes will have the correct value of the key, and 1 node will have a stail value.
+
+If the client wants to read the data, it sends 3 read requests (1 request/node).
+
+The client will receive different values from different nodes.
+
+It uses the value's version number to determine the most up-to-date value.
+
+For this to work, we should enforce the following rule:
+- a write operation is successful only if it is successfully processed by at least 2 replicas
+- same applies to read operations
+
+#### Read Repair 
+
+Read repair is done by the client when it detects stale data in the response to a read request. 
+
+When this happens, it sends the up-to-date value to the stale replica so it can be updated.
+
+#### Anti-Entropy process
+
+A background proces can constantly look for differences in the data between replicas and copy any missing data from one replica to another.
+
+#### Quorums for reading and writing
+
+If there are n replicas, every write must be confirmed by w nodes to be considered successful, and we must query at least r nodes for each read.
+
+As long as `w+r>n`, we expect to get an up-to-date value when reading.
+
+Reads and writes obeying this rule are called *quorum* reads and writes.
+
+A common choice is to make n odd (typically 3 or 5), and set `w = r = (n+1)/2`
+
+We can very w and r depending on the use case. For example, we can set `w=n` and `r=1` for a system with few writes and many reads.
+
+The rule `w + r > n` allows the system to tolerate unavailable nodes as follows:
+- if `w<n`: we can still process writes if a node is unavailable
+- if `r<n`: we can still process reads if a node is unavailable
+
+In fact, we can tolerate `max(0,n-w)` node failures for writes, and `max(0,n-r)` for reads.
+
+Normally, reads and writes are sent to all nodes in parallel. However, we only wait for responses from `w` or `r` nodes to consider the operation successful.
+
+The figure below explains the idea:
+
+![1735924914411](image/summary/1735924914411.png)
+
+### Limitations of Quorum Consistency
+
+Setting `w+r<=n` will more likely result in reading stale values, but has the advantage of providing better availability and lower latency.
+
+However, even with `w+r>n` there are edge-cases where stale values are returned. Possible scenarios include:
+* Using sloppy quoroms: write and reads might end up on different nodes so that there is no more an overlap between them.
+* If two writes occur concurrently, we will need to resolve the conflict (e.g. by merging), else we will risk data loss.
+* If write happens concurrently with a read, it might be reflected only on some replicas.
+* If a write succeeds on less than w replicas, it is considered a failed operation globally. However, the value is not rolled-back on the replicas that successfully processed the request. Subsequent reads may or may not return the value from that write.
+* If a node carrying the new value fails, and data is restored from a replica with a stale value, we might fall below the minimum of w nodes with up-to-date value.
+
+Previously mentioned anomalies can appear in such databases:
+- monotonic reads
+- reading your writes
+- consistent prefix reads
+
+#### Monitoring Staleness
+
+In leader-based replication, the database typically exposes metrics for the replication lag, which can be fed to the monitoring system. 
+
+In leaderless replication, there is no fixed order in which writes are applied, which makes monitoring more difficult. If anti-entropy is not used, there is no limit on how old a value might become.
+
+### Sloppy Quoroms and Hinted Handoff
+
+Even with `w+r>n`, a network interruption can easily cut off a client from a large number of database nodes.
+
+Although the nodes are alive, they are not reachable, so the client can't reach a quorum.
+
+#### Sloppy Quorum
+
+In a large cluster (significantly more than n nodes), the database might accept writes anyways if the user can't reach a quorum, and perform the writes on some nodes that are reachable but aren't among the n nodes on which the value usually lives. This is known as sloppy quorum.
+
+#### Hinted Handoff
+
+Once the unreachable nodes are reachable again, the value is copied over to the nodes that belong the n nodes that should hold the value.
+
+This operation is called Hinted Handoff.
+
+#### Why use sloppy quorums?
+
+Sloppy quorums are useful to increase write availability: as long as any w nodes are available, the database can accept writes.
+
+However, it means that even when `w+r>n`, we can't guarantee that the most up-to-date value is read.
+
+#### Applying leaderless replication in multidatacenter setup
+
+The number of replicas n includes nodes in all datacenters, and in the configuration you can specify how many of the n replicas you want to have in each datacenter.
+
+Each write is sent to all replicas regardless of the datacenter, but waits only for an acknowledgement from a quorum of nodes within its local datacenter so that it is unaffected by delays and interruptions on the cross-datacenter link.
+
+Cross-datacenter writes are often done asynchronously.
+
+### Detecting Concurrent Writes
+
+The problem is that events may arrive in a different order at different nodes, due to variable network delays and partial failure. 
+
+The figure below gives an example:
+
+![1735926409227](image/summary/1735926409227.png)
+
+As you can see, we end up with different values on different nodes.
+
+We should make sure all replicas converge towards the same value.
+
+#### LWW
+
+Last Write Wins was already discussed. It achieves the goal of eventual consistency, but it comes at the cost of losing data durability.
+
+In some applications, like caching, losing data is acceptable.
+
+#### Happens-before relationship and concurrency
+
+If two events are causally related, then they are not concurrent.
+
+An operation A happens before another operation B if B knows about A, or depends on A, or builds upon A in some way.
+
+As a rule of thumb, 2 operations are concurrent if neither happens before the other (i.e neither knows about the other).
+
+For any two events A and B, we have only 3 cases:
+- A happened before B
+- B happened before A
+- A and B are concurrent
+
+If operations are concurrent, we have a conflict that needs to be resolved.
+
+#### Capturing the happens-before relationship
+
+There is an algorithm that determines whether 2 operations are concurrent or whether one happened before the other.
+
+* The server maintains a version number for every key, increments the version number every time that key is writtem, and stores the new version number along with the value written.
+* When a client reads a key, the server returns all values that have not been overwritten, as well as the latest version number. A client must read a key before writing.
+* When a client writes a key, it should include the version number from the prior read, and it must merge together all values that it received in the prior read. The response from the server will be like a read, returning all current values, which allows us to chain several writes.
+* When the server receives a write with a particular version number, it can overwrite all values with that version or below (since it knows they have been merged), but it must keep all values with a higher version number (because those values are concurrent with the incoming write).
+
+In this algorithm, we made a simplification that we have only replica. Next sections will explain how version vectors can be used to generalise this idea.
+
+When a write includes the version number from a prior read, that tells us which previous state the write is based on. A write with no version number will be concurrent with all existing writes.
+
+
+An example is shown in the figure below:
+
+![1735927193496](image/summary/1735927193496.png)
+
+The sketch below illustrates the state of each of the clients and the server at each transaction:
+
+![1735927836892](image/summary/1735927836892.png)
+
+##### Merging Concurrently Written Values
+
+The explained algorithm ensures no data is silently dropped, but it requires that the clients do somw extra work (i.e. merging concurrent data).
+
+The merging logic depends on the application context.
+
+There is some research to design data structures that support automatic merging for conflict resolution purposes.
+
+##### Version Vectors
+
+When having multiple replicas with no leader, the algorithm above doesn't work as it is.
+
+A single version number was used to capture dependencies between operations on one replica.
+
+To support tracking dependencies on multiple replicas, we need to maintain one version number per replica as well as per key.
+
+This is known as *Version Vector*.
+
+Each replica increments its own version number when processing a write, and also keeps track of the version numbers it has seen from each of the other replicas.
+
+This information indicates which data should be over-written and which data should be kept as siblings.
+
+Riak uses a variant of this idea valled *dotted version vector*.
+
+Version vectors are sent from the database replicas to clients when values are read, and need to be sent back to the database when a value is written. This vector allows distinguishing between overwrites and concurrent writes.
+
+
 
