@@ -1,0 +1,3 @@
+- Dive into ZooKeeper
+- Implement Raft Consensus Algorithm
+- Dive into how kubernetes implements leader election
